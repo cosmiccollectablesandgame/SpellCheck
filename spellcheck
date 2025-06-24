@@ -1,0 +1,185 @@
+// @ts-nocheck
+
+var DATE_SHEET_REGEX = /^\d{2}-\d{2}[A-Z]?-[0-9]{4}$/; // mm-dd-yyyy or mm-ddX-yyyy
+
+/**
+ * Cosmic Games Integrated Spellcheck & Cleanup Utility (v3.3.5)
+ * Combines interactive spellcheck for all core sheets and date-named event tabs
+ */
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Cosmic Tools')
+    .addItem('🔍 Spell Check All Names', 'SPELLCHECK_ALL_NAMES')
+    .addItem('🏅 Find Frequent Players', 'FIND_PLAYER_ACHIEVEMENTS')
+    .addToUi();
+}
+
+/**
+ * Entry point: collect all mismatches and launch review dialog
+ */
+function SPELLCHECK_ALL_NAMES() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const prefSheet = ss.getSheetByName('PreferredNames');
+  if (!prefSheet) return ui.alert('Missing PreferredNames sheet');
+
+  // Load preferred names
+  const preferred = prefSheet.getRange('A2:A')
+    .getValues().flat().map(n => (n||'').toString().trim()).filter(n => n);
+  const lowerPref = preferred.map(n => n.toLowerCase());
+
+  // Determine sheets to scan
+  const targets = [];
+  // Core tabs
+  ['Player''s Prize-Wall-Points', 'MissionLog', 'Tab/Snacks/StoreCredit', 'StoreCreditLog', 'TournamentResults']
+    .forEach(name => {
+      const col = (name === 'TournamentResults') ? 2 : 1;
+      if (ss.getSheetByName(name)) targets.push({sheet:name, col});
+    });
+  // Date-named event tabs
+  ss.getSheets().forEach(sh => {
+    const name = sh.getName();
+    if (DATE_SHEET_REGEX.test(name)) targets.push({sheet:name, col:2});
+  });
+
+  // Collect issues
+  const issues = [];
+  targets.forEach(({sheet, col}) => {
+    const sh = ss.getSheetByName(sheet);
+    const last = sh.getLastRow();
+    if (last < 2) return;
+    const values = sh.getRange(2, col, last-1, 1).getValues().flat();
+    values.forEach((v,i) => {
+      const name = (v||'').toString().trim();
+      if (!name) return;
+      if (!lowerPref.includes(name.toLowerCase())) {
+        issues.push({name, sheet, row: i+2, col});
+      }
+    });
+  });
+
+  if (!issues.length) return ui.alert('No spelling issues found!');
+
+  // Store in properties
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('spell_issues', JSON.stringify(issues));
+  props.setProperty('spell_idx', '0');
+  props.setProperty('preferred_names', JSON.stringify(preferred));
+
+  // Launch review
+  showNextSpellcheckIssue();
+}
+
+/**
+ * Show the next name mismatch in a modal dialog for manual review
+ */
+function showNextSpellcheckIssue() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const issues = JSON.parse(props.getProperty('spell_issues') || '[]');
+  let idx = Number(props.getProperty('spell_idx') || 0);
+
+  if (idx >= issues.length) {
+    props.deleteAllProperties();
+    return ui.alert('✅ All names reviewed!', 'SpellCheck');
+  }
+
+  const issue = issues[idx];
+  const input = issue.name.toLowerCase();
+  const preferred = JSON.parse(props.getProperty('preferred_names') || '[]');
+
+  // Build suggestions
+  let suggestions = preferred.filter(p => p.toLowerCase().includes(input));
+  suggestions = suggestions.concat(preferred.filter(p => p.toLowerCase().startsWith(input)));
+  if (suggestions.length < 5) {
+    const scored = preferred.map(p => ({p, d: levenshteinDistance(input, p.toLowerCase())}));
+    scored.sort((a,b) => a.d - b.d).slice(0, 5 - suggestions.length)
+      .forEach(o => suggestions.push(o.p));
+  }
+  suggestions = [...new Set(suggestions)].slice(0, 5);
+
+  // Build and display HTML
+  const html = HtmlService.createHtmlOutput(`
+    <html><body style="font-family:Arial,sans-serif;padding:20px;">
+      <h3>Review ${idx+1} of ${issues.length}</h3>
+      <p><strong>Found:</strong> ${escapeHtml(issue.name)}</p>
+      <p><strong>Location:</strong> ${escapeHtml(issue.sheet)}!${issue.col}${issue.row}</p>
+      <select id="pick" style="width:100%" onchange="full.value=this.value">
+        <option value="">-- Suggestions --</option>
+        ${suggestions.map(s => `<option>${escapeHtml(s)}</option>`).join('')}
+      </select>
+      <br><br>
+      <input id="full" style="width:100%;padding:5px;font-size:14px;" value="${escapeHtml(issue.name)}"/>
+      <br><br>
+      <button onclick="submit('save')">✅ Apply</button>
+      <button onclick="submit('add')">➕ Add to Preferred</button>
+      <button onclick="submit('skip')">⏭️ Skip</button>
+      <button onclick="submit('erase')">🗑️ Erase</button>
+      <script>
+        function submit(action) {
+          const val = document.getElementById('full').value;
+          google.script.run.withSuccessHandler(()=>google.script.host.close())
+            .handleSpellcheckAction(action, val);
+        }
+      </script>
+    </body></html>
+  `).setWidth(500).setHeight(350);
+
+  ui.showModalDialog(html, 'Spellcheck Review');
+}
+
+/**
+ * Handle modal actions: save correction, add to preferred, skip, or erase
+ */
+function handleSpellcheckAction(action, newName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  const issues = JSON.parse(props.getProperty('spell_issues') || '[]');
+  let idx = Number(props.getProperty('spell_idx') || 0);
+  if (idx >= issues.length) return;
+
+  const issue = issues[idx];
+  const sheet = ss.getSheetByName(issue.sheet);
+
+  if (action === 'save' && newName.trim()) {
+    sheet.getRange(issue.row, issue.col).setValue(newName.trim());
+  } else if (action === 'add' && newName.trim()) {
+    ss.getSheetByName('PreferredNames').appendRow([newName.trim()]);
+    sheet.getRange(issue.row, issue.col).setValue(newName.trim());
+  } else if (action === 'erase') {
+    sheet.getRange(issue.row, issue.col).clearContent();
+  }
+
+  props.setProperty('spell_idx', String(idx + 1));
+  showNextSpellcheckIssue();
+}
+
+/**
+ * Escape HTML chars to prevent injection
+ */
+function escapeHtml(text) {
+  return (text||'').toString()
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+/**
+ * Compute Levenshtein distance between two strings
+ */
+function levenshteinDistance(a, b) {
+  const m = Array(a.length+1).fill().map(() => Array(b.length+1).fill(0));
+  for (let i=0; i<=a.length; i++) m[i][0] = i;
+  for (let j=0; j<=b.length; j++) m[0][j] = j;
+  for (let i=1; i<=a.length; i++) {
+    for (let j=1; j<=b.length; j++) {
+      const cost = a[i-1] === b[j-1] ? 0 : 1;
+      m[i][j] = Math.min(m[i-1][j]+1, m[i][j-1]+1, m[i-1][j-1]+cost);
+    }
+  }
+  return m[a.length][b.length];
+}
