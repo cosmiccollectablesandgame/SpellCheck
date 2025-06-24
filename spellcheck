@@ -32,7 +32,7 @@ function SPELLCHECK_ALL_NAMES() {
   // Determine sheets to scan
   const targets = [];
   // Core tabs
-  ['Player''s Prize-Wall-Points', 'MissionLog', 'Tab/Snacks/StoreCredit', 'StoreCreditLog', 'TournamentResults']
+  ['Player\'s Prize-Wall-Points', 'MissionLog', 'Tab/Snacks/StoreCredit', 'StoreCreditLog', 'TournamentResults']
     .forEach(name => {
       const col = (name === 'TournamentResults') ? 2 : 1;
       if (ss.getSheetByName(name)) targets.push({sheet:name, col});
